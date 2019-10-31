@@ -17,7 +17,8 @@ const prop = "local"
 func main() {
 	doneChan := make(chan bool)
 	flagChan := make(chan bool)
-	sessionChan := make(chan *concurrency.Session)
+	var cancel func()
+	var ctx context.Context
 	clientConfig := clientv3.Config{
 		Endpoints:   []string{"localhost:2379"},
 		DialOptions: []grpc.DialOption{grpc.WithBlock()},
@@ -31,14 +32,18 @@ func main() {
 	defer cli.Close()
 
 	sub := observer.NewSubject("")
-	obs := observer.NewObserver(func(s interface{}) {
-		log.Println(s)
+	obs := observer.NewObserver(func(oldState interface{}, newState interface{}) {
+		log.Println("I am", newState)
+		time.Sleep(5 * time.Second)
+		if newState == "master" && oldState == "slave" {
+			cancel()
+		}
+		if newState == "slave" {
+			ctx, cancel = context.WithCancel(context.Background())
+			go campaign(ctx, cli, prefix, prop, flagChan)
+		}
 	})
 	sub.Attach(obs)
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go campaign(ctx, cli, prefix, prop, sessionChan, flagChan)
 
 	go func() {
 		for {
@@ -54,13 +59,12 @@ func main() {
 		}
 	}()
 
+	flagChan <- false
 	<-doneChan
-	cancel()
 }
 
-func campaign(ctx context.Context, cli *clientv3.Client, prefix string, prop string, sessionChan chan *concurrency.Session, flagC chan bool) {
+func campaign(ctx context.Context, cli *clientv3.Client, prefix string, prop string, flagC chan bool) {
 	//TTL means how long the key will survey
-	flagC <- false
 	session, err := concurrency.NewSession(cli, concurrency.WithTTL(3))
 	if err != nil {
 		log.Fatal(err)
@@ -74,10 +78,15 @@ func campaign(ctx context.Context, cli *clientv3.Client, prefix string, prop str
 
 	log.Println("Campaign: success")
 	flagC <- true
-	sessionChan <- session
 
-	select {
-	case <-session.Done():
-		log.Println("elect: expired")
+	for {
+		select {
+		case <-session.Done():
+			log.Println("elect: expired")
+			flagC <- false
+			return
+		case <-ctx.Done():
+			session.Orphan()
+		}
 	}
 }
